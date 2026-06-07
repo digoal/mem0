@@ -1,0 +1,26 @@
+---
+title: "Graph Stores"
+description: "Configure relationship-aware memory on top of a property graph backend. Mem0 currently supports Apache AGE; Neo4j, Memgraph, and Kuzu are planned."
+---
+
+Graph memory is an optional layer on top of vector memory. It stores
+`(entity, relationship, entity)` triples so that, given a starting node,
+Mem0 can traverse the graph to surface connected facts that vector
+similarity alone would miss (e.g. "the user works on a project that uses
+library X" — discovered by following edges rather than embedding match).
+
+The graph store is configured under the `graph` key of `MemoryConfig`. When
+omitted, Mem0 behaves exactly as before — graph memory is opt-in.
+
+### When to enable it
+
+- You store relational knowledge: people, projects, dependencies,
+  preferences about *how things connect*, not just *what things are*.
+- You want relationship queries (`get_neighbors`, depth-limited traversal)
+  in addition to vector search.
+- You're already running PostgreSQL or another supported graph backend.
+
+### When to skip it
+
+- Pure conversational memory where vector similarity is enough.
+- You don't have a graph-capable database in your stack.

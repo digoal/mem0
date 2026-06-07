@@ -1,0 +1,122 @@
+---
+title: "Apache AGE"
+description: "Use Apache AGE as a graph store in Mem0 — runs on PostgreSQL alongside pgvector, with a shared connection pool option."
+---
+
+[Apache AGE](https://age.apache.org/) is a PostgreSQL extension that adds
+property-graph capabilities using a Cypher-like query language. Because it
+runs inside PostgreSQL, Mem0 deployments that already use `pgvector` for
+vector storage can add graph memory on the **same database instance** —
+and, with the `connection_pool` argument, the **same connection pool** for
+true single-PostgreSQL deployment.
+
+### Prerequisites
+
+```bash
+# Install AGE in your PostgreSQL instance (apt or pgdg).
+# See https://age.apache.org/getstarted/ for the version that matches your
+# Postgres major version.
+```
+
+### One PostgreSQL, two stores (vector + graph)
+
+```python
+import os
+from mem0 import Memory
+
+os.environ["OPENAI_API_KEY"] = "sk-xx"
+
+config = {
+    "vector_store": {
+        "provider": "pgvector",
+        "config": {
+            "user": "test",
+            "password": "123",
+            "host": "127.0.0.1",
+            "port": "5432",
+        },
+    },
+    "graph": {
+        "provider": "apache_age",
+        "config": {
+            "user": "test",
+            "password": "123",
+            "host": "127.0.0.1",
+            "port": "5432",
+            "graph_name": "mem0_graph",
+        },
+    },
+}
+
+m = Memory.from_config(config)
+```
+
+### Sharing a connection pool (no second pool)
+
+When both stores point at the same PostgreSQL, you can hand the AGE store
+the **same** pool that pgvector built. This avoids opening a second pool
+and lets a single `psycopg` connection serve both `vector` and `cypher`
+queries during the same request lifecycle.
+
+```python
+from mem0.vector_stores.pgvector import PGVector
+from mem0.graphs.apache_age import ApacheAGE
+
+shared_pool = PGVector._PGVector__build_pool(  # or build your own
+    conninfo="postgresql://test:123@127.0.0.1:5432/postgres",
+    min_size=1,
+    max_size=5,
+)
+
+# Both stores now share `shared_pool`.
+# (See tests/graphs/test_apache_age.py::test_init_with_shared_connection_pool
+# for a runnable example using a mocked pool.)
+```
+
+### Adding triples to the graph
+
+Mem0 doesn't auto-extract `(entity, relation, entity)` triples from text
+yet — the LLM-based extractor is on the roadmap. For now, pass pre-extracted
+triples explicitly:
+
+```python
+m = Memory.from_config(config)
+
+triples = [
+    {
+        "source":     {"label": "Person",  "name": "alice", "properties": {"role": "engineer"}},
+        "relationship": "WORKS_ON",
+        "target":     {"label": "Project", "name": "mem0",   "properties": {}},
+    },
+    {
+        # Re-using alice is deduped within this call.
+        "source":     {"label": "Person",   "name": "alice", "properties": {}},
+        "relationship": "USES",
+        "target":     {"label": "Library",  "name": "pgvector", "properties": {}},
+    },
+]
+
+results = m.add_to_graph(triples, memory_id="mem-1")
+# [{"source_id": "1", "target_id": "2", "edge_id": "5"}, ...]
+
+# Traverse the graph from any node.
+neighbors = m.search_graph("alice", limit=10)
+```
+
+### API surface
+
+| Method | Purpose |
+|--------|---------|
+| `Memory.add_to_graph(triples, memory_id=None)` | Insert `(source, rel, target)` triples. Deduplicates nodes by `(label, name)` within the call. Tags every node/edge with `memory_id` when supplied. |
+| `Memory.search_graph(query, limit=10, filters=None)` | Full-property substring search with optional payload filter. |
+| `Memory.graph_store` | Lazy-initialized property; `None` when no graph config was supplied. |
+
+### Operational notes
+
+- The graph is created on first use (`CREATE EXTENSION IF NOT EXISTS age` +
+  `SELECT create_graph('<name>')`). No manual SQL setup is required.
+- Graph names, node labels, and relationship types are restricted to the
+  identifier charset `[A-Za-z_][A-Za-z0-9_]*` to keep Cypher queries
+  injection-safe.
+- Reset the graph with `store.reset()` — drops and recreates the AGE
+  namespace, but leaves the `age` extension in place.

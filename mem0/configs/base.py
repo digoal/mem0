@@ -26,6 +26,25 @@ class MemoryItem(BaseModel):
     updated_at: Optional[str] = Field(None, description="The timestamp when the memory was updated")
 
 
+class GraphStoreConfig(BaseModel):
+    """Top-level graph store configuration.
+
+    ``provider`` selects the backend (currently ``"apache_age"``) and
+    ``config`` is forwarded to the provider-specific Pydantic model
+    (e.g. :class:`mem0.configs.graphs.apache_age.ApacheAGEConfig`).
+    """
+
+    provider: str = Field("apache_age", description="Graph store provider name")
+    config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Provider-specific configuration (e.g. ApacheAGEConfig fields).",
+    )
+    threshold: float = Field(
+        0.7,
+        description="Score threshold for graph search results (provider-defined).",
+    )
+
+
 class MemoryConfig(BaseModel):
     vector_store: VectorStoreConfig = Field(
         description="Configuration for the vector store",
@@ -45,6 +64,10 @@ class MemoryConfig(BaseModel):
     )
     reranker: Optional[RerankerConfig] = Field(
         description="Configuration for the reranker",
+        default=None,
+    )
+    graph: Optional[GraphStoreConfig] = Field(
+        description="Optional graph store configuration for relationship memory",
         default=None,
     )
     version: str = Field(

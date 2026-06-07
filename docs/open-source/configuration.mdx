@@ -77,6 +77,13 @@ config = {
         "provider": "cohere",
         "config": {"model": "rerank-english-v3.0"},
     },
+    "graph": {  # optional — relationship-aware memory
+        "provider": "apache_age",
+        "config": {
+            "user": "postgres", "password": "postgres",
+            "host": "localhost", "port": 5432,
+        },
+    },
 }
 
 memory = Memory.from_config(config)

@@ -8,7 +8,7 @@ import uuid
 import warnings
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import ValidationError
 
@@ -35,6 +35,7 @@ from mem0.memory.utils import (
 from mem0.utils.entity_extraction import extract_entities, extract_entities_batch
 from mem0.utils.factory import (
     EmbedderFactory,
+    GraphStoreFactory,
     LlmFactory,
     RerankerFactory,
     VectorStoreFactory,
@@ -357,6 +358,10 @@ class Memory(MemoryBase):
         # Entity store is initialized lazily on first use
         self._entity_store = None
 
+        # Graph store is initialized lazily on first use; only created if a
+        # graph config was supplied. Stays None when feature is unused.
+        self._graph_store = None
+
         if MEM0_TELEMETRY:
             # Create telemetry config manually to avoid deepcopy issues with thread locks
             telemetry_config_dict = {}
@@ -409,6 +414,95 @@ class Memory(MemoryBase):
                 self.config.vector_store.provider, entity_config
             )
         return self._entity_store
+
+    @property
+    def graph_store(self):
+        """Lazily initialize the optional graph store on first use.
+
+        Returns ``None`` when no graph backend was configured (i.e. the
+        default), so callers must check for ``None`` before use. When
+        configured, the same connection pool as :attr:`vector_store` is
+        reused automatically by the Apache AGE backend when both stores
+        point at the same PostgreSQL instance.
+        """
+        if self._graph_store is None and self.config.graph is not None:
+            self._graph_store = GraphStoreFactory.create(
+                self.config.graph.provider,
+                self.config.graph.config,
+            )
+        return self._graph_store
+
+    def add_to_graph(
+        self,
+        triples: List[Dict[str, Any]],
+        memory_id: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """Add ``(source_entity, relation, target_entity)`` triples to the graph.
+
+        Each triple is a dict with keys:
+            - ``source``: ``{"label": str, "name": str, "properties": dict}``
+            - ``relationship``: ``str`` (e.g. ``"WORKS_ON"``)
+            - ``target``: ``{"label": str, "name": str, "properties": dict}``
+            - ``properties``: ``dict`` (optional, edge properties)
+
+        Nodes are deduplicated by (label, name) within the same call so that
+        the same entity referenced by multiple triples is only inserted once.
+        If ``memory_id`` is provided it is attached as a property on every
+        created node and edge, so callers can later reconstruct which
+        memories gave rise to which graph fragment.
+
+        Returns:
+            A list of ``{"source_id", "target_id", "edge_id"}`` dicts, one
+            per input triple. Returns an empty list when no graph store is
+            configured.
+        """
+        store = self.graph_store
+        if store is None:
+            logger.debug("add_to_graph called with no graph store configured")
+            return []
+
+        # Cache of (label, name) -> node id to dedupe within this batch.
+        node_cache: Dict[tuple, str] = {}
+        results: List[Dict[str, str]] = []
+
+        def _node_id(label: str, name: str, props: Dict[str, Any]) -> str:
+            key = (label, name)
+            if key in node_cache:
+                return node_cache[key]
+            node_props = dict(props or {})
+            node_props["name"] = name
+            if memory_id is not None:
+                node_props["memory_id"] = memory_id
+            node_cache[key] = store.add_node(label, node_props)
+            return node_cache[key]
+
+        for triple in triples:
+            src = triple["source"]
+            tgt = triple["target"]
+            rel = triple["relationship"]
+            edge_props = dict(triple.get("properties") or {})
+            if memory_id is not None:
+                edge_props["memory_id"] = memory_id
+
+            src_id = _node_id(src["label"], src["name"], src.get("properties"))
+            tgt_id = _node_id(tgt["label"], tgt["name"], tgt.get("properties"))
+            edge_id = store.add_edge(src_id, tgt_id, rel, edge_props)
+            results.append(
+                {"source_id": src_id, "target_id": tgt_id, "edge_id": edge_id}
+            )
+        return results
+
+    def search_graph(
+        self,
+        query: str,
+        limit: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search the configured graph store. Returns ``[]`` if not configured."""
+        store = self.graph_store
+        if store is None:
+            return []
+        return store.search(query, limit=limit, filters=filters)
 
     def _upsert_entity(self, entity_text, entity_type, memory_id, filters):
         """Upsert an entity into the entity store, linking it to a memory."""
@@ -1811,6 +1905,10 @@ class AsyncMemory(MemoryBase):
         self.custom_instructions = self.config.custom_instructions
         self._entity_store = None
 
+        # Graph store is initialized lazily on first use; only created if a
+        # graph config was supplied. Stays None when feature is unused.
+        self._graph_store = None
+
         # Initialize reranker if configured
         self.reranker = None
         if config.reranker:
@@ -1852,6 +1950,42 @@ class AsyncMemory(MemoryBase):
                 self.config.vector_store.provider, entity_config
             )
         return self._entity_store
+
+    @property
+    def graph_store(self):
+        """Async variant — see :meth:`Memory.graph_store` for details."""
+        if self._graph_store is None and self.config.graph is not None:
+            self._graph_store = GraphStoreFactory.create(
+                self.config.graph.provider,
+                self.config.graph.config,
+            )
+        return self._graph_store
+
+    async def add_to_graph(
+        self,
+        triples: List[Dict[str, Any]],
+        memory_id: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """Async variant of :meth:`Memory.add_to_graph`."""
+        return await asyncio.to_thread(
+            Memory.add_to_graph.__get__(self, type(self)),
+            triples,
+            memory_id,
+        )
+
+    async def search_graph(
+        self,
+        query: str,
+        limit: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Async variant of :meth:`Memory.search_graph`."""
+        return await asyncio.to_thread(
+            Memory.search_graph.__get__(self, type(self)),
+            query,
+            limit,
+            filters,
+        )
 
     async def _upsert_entity_async(self, entity_text, entity_type, memory_id, filters):
         """Async variant of `_upsert_entity` — per-entity search-then-update-or-insert."""

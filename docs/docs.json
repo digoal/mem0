@@ -295,6 +295,20 @@
                             ]
                           }
                         ]
+                      },
+                      {
+                        "group": "Graph Stores",
+                        "icon": "share-nodes",
+                        "pages": [
+                          "components/graph-stores/overview",
+                          {
+                            "group": "Supported Graph Stores",
+                            "icon": "list",
+                            "pages": [
+                              "components/graph-stores/dbs/apache_age"
+                            ]
+                          }
+                        ]
                       }
                     ]
                   },

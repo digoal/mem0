@@ -262,3 +262,31 @@ class RerankerFactory:
             raise ImportError(f"Could not import reranker for provider '{provider_name}': {e}")
 
         return reranker_class(config)
+
+
+class GraphStoreFactory:
+    """Factory for graph store backends (Apache AGE, Neo4j, Memgraph, ...).
+
+    Mirrors :class:`VectorStoreFactory` so callers can switch providers by
+    changing a single string. New providers are added by registering an
+    entry in ``provider_to_class``.
+    """
+
+    provider_to_class = {
+        "apache_age": "mem0.graphs.apache_age.ApacheAGE",
+    }
+
+    @classmethod
+    def create(cls, provider_name: str, config):
+        class_type = cls.provider_to_class.get(provider_name)
+        if not class_type:
+            raise ValueError(f"Unsupported GraphStore provider: {provider_name}")
+        if not isinstance(config, dict):
+            config = config.model_dump()
+        graph_store_class = load_class(class_type)
+        return graph_store_class(**config)
+
+    @classmethod
+    def reset(cls, instance):
+        instance.reset()
+        return instance
