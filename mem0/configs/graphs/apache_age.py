@@ -48,13 +48,11 @@ class ApacheAGEConfig(BaseModel):
         host, port = values.get("host"), values.get("port")
         if not user and not password:
             raise ValueError(
-                "Both 'user' and 'password' must be provided when not using "
-                "connection_string or connection_pool."
+                "Both 'user' and 'password' must be provided when not using connection_string or connection_pool."
             )
         if not host and not port:
             raise ValueError(
-                "Both 'host' and 'port' must be provided when not using "
-                "connection_string or connection_pool."
+                "Both 'host' and 'port' must be provided when not using connection_string or connection_pool."
             )
         return values
 

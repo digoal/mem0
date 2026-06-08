@@ -1,0 +1,542 @@
+---
+title: "Claude Code (自托管 · pgvector + Apache AGE)"
+description: "把 mem0 接入 Claude Code，但用本地 PostgreSQL（pgvector + Apache AGE）作为向量库与图库，不依赖 Mem0 平台 API。"
+---
+
+本页介绍**自托管**场景：mem0 的向量存储与图存储都跑在你自己的 PostgreSQL 实例上，向量用 `pgvector`、图用 `apache_age` 扩展。Claude Code 通过一个本地 stdio MCP 服务器访问 mem0。
+
+> 默认 Claude Code 集成（见 [Claude Code](/integrations/claude-code)）走的是 Mem0 平台（`mcp.mem0.ai`）。如果你不想把对话发给 Mem0 云端，或者需要把记忆和图关系落到自己的数据库里，就用本节的自托管方案。
+
+## 架构
+
+```
+┌──────────────────┐    stdio     ┌──────────────────────┐    psycopg    ┌────────────────────────────┐
+│  Claude Code     │ ───────────▶ │ mem0-local-mcp-server │ ───────────▶ │  PostgreSQL                │
+│  (CLI / Cowork)  │ ◀─────────── │ (Python MCP server)   │ ◀─────────── │  ├─ pgvector (向量)         │
+└──────────────────┘              └──────────────────────┘              │  └─ Apache AGE (图)         │
+                                                                     └────────────────────────────┘
+```
+
+要点：
+- **Claude Code ↔ MCP server**：stdio（推荐），免开端口；
+- **MCP server ↔ PostgreSQL**：直接用 `psycopg2`/`psycopg` 连接一个 `pgvector + apache_age` 同库的实例；
+- **同一连接池**：mem0 的 `vector_store` 和 `graph_store` 都指向同一个 PostgreSQL，可以共享连接池（见 [Apache AGE 文档](/components/graph-stores/dbs/apache_age)）。
+
+## 1. 前置条件
+
+| 依赖 | 版本要求 | 备注 |
+| --- | --- | --- |
+| PostgreSQL | 14+ | 与 `pgvector`、`apache_age` 同时支持的版本 |
+| pgvector | 与 PG 主版本匹配 | `CREATE EXTENSION vector` |
+| Apache AGE | 1.5+（建议 1.7+） | `CREATE EXTENSION age` |
+| Python | 3.10+ | 用于运行 mem0 SDK 和本地 MCP server |
+| Claude Code | 最新版 | CLI 或 Cowork 桌面端 |
+
+Python 包：
+```bash
+pip install "mem0ai[pgvector]" mcp psycopg2-binary
+# 或者 psycopg3：
+# pip install "mem0ai[pgvector]" mcp "psycopg[binary,pool]"
+```
+
+## 2. 准备 PostgreSQL
+
+### 2.1 安装扩展
+
+按官方文档装好 `pgvector` 和 `apache_age`，然后建库：
+
+```bash
+psql -h <host> -U postgres <<'SQL'
+CREATE DATABASE mem0 OWNER postgres;
+\c mem0
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS age;
+-- 让数据库默认带 ag_catalog 搜索路径（mem0 不强依赖此设置，但 AGE 工具链需要）
+ALTER DATABASE mem0 SET search_path = ag_catalog, public;
+SQL
+```
+
+如果数据库不是 `UTF8` 编码，建库时需要显式指定：`CREATE DATABASE mem0 OWNER postgres ENCODING 'UTF8' LC_COLLATE 'C' TEMPLATE template0;` —— mem0 允许存任意 UTF-8 文本（包括中文属性名/属性值）。
+
+### 2.2 创建角色（可选）
+
+```sql
+CREATE USER mem0_app WITH PASSWORD 'change-me';
+GRANT ALL PRIVILEGES ON DATABASE mem0 TO mem0_app;
+\c mem0
+GRANT ALL ON SCHEMA public TO mem0_app;
+-- AGE 图存储需要 ownership 级别的权限：
+GRANT ALL ON SCHEMA ag_catalog TO mem0_app;
+```
+
+## 3. mem0 配置文件
+
+把数据库连接信息写到 `~/.mem0/config.json`（或项目根目录的 `mem0_config.json`）：
+
+```json
+{
+  "llm": {
+    "provider": "openai",
+    "config": {
+      "model": "gpt-4o-mini",
+      "api_key": "${OPENAI_API_KEY}"
+    }
+  },
+  "embedder": {
+    "provider": "openai",
+    "config": {
+      "model": "text-embedding-3-small",
+      "api_key": "${OPENAI_API_KEY}"
+    }
+  },
+  "vector_store": {
+    "provider": "pgvector",
+    "config": {
+      "user": "mem0_app",
+      "password": "change-me",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "dbname": "mem0",
+      "collection_name": "mem0_vectors",
+      "embedding_model_dims": 1536
+    }
+  },
+  "graph_store": {
+    "provider": "apache_age",
+    "config": {
+      "user": "mem0_app",
+      "password": "change-me",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "dbname": "mem0",
+      "graph_name": "mem0_graph"
+    }
+  },
+  "history_db_path": "~/.mem0/history.db"
+}
+```
+
+`${OPENAI_API_KEY}` 这种写法会被 `mem0ai` 直接读环境变量（也可以用任何你正在用的 LLM/embedding 提供商，详见 [LLM 文档](https://docs.mem0.ai/components/llms/overview)）。
+
+> **共享连接池（推荐）**：如果想让 vector 和 graph 共用一个连接池（少开一组连接，且能在同一次请求里共用事务），见 [Apache AGE 文档的 “Sharing a connection pool” 章节](/components/graph-stores/dbs/apache_age#sharing-a-connection-pool-no-second-pool)。
+
+## 4. 本地 MCP 服务器
+
+默认的 [Claude Code 插件](https://docs.mem0.ai/integrations/claude-code) 走 Mem0 云。要把它指向本地 mem0，你需要启动一个 stdio MCP 服务器，把 mem0 SDK 包装成 9 个 MCP 工具（`add_memory`、`search_memories` 等）。
+
+### 4.1 写 MCP 服务器
+
+`~/.mem0/local_mcp_server.py`：
+
+```python
+"""Local MCP server exposing self-hosted mem0 over stdio."""
+import asyncio
+import json
+import os
+import sys
+from typing import Any
+
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import TextContent, Tool
+
+from mem0 import Memory
+
+CONFIG_PATH = os.environ.get("MEM0_CONFIG", os.path.expanduser("~/.mem0/config.json"))
+
+
+def _load_memory() -> Memory:
+    """Read the JSON config and construct a self-hosted Memory instance.
+
+    The config is re-read on every call so a config edit (e.g. switching
+    graph_name or rotating credentials) is picked up without restarting
+    the MCP server. ``Memory.from_config`` accepts the same shape as the
+    JSON file above.
+    """
+    with open(CONFIG_PATH) as f:
+        return Memory.from_config(json.load(f))
+
+
+# Lazy-initialize the Memory instance on first use; recreate on every call
+# so config edits are honored and we don't leak connection state across
+# long-lived sessions.
+def _mem() -> Memory:
+    return _load_memory()
+
+
+async def _call(tool: str, **kwargs: Any) -> str:
+    """Invoke a mem0 method and return a JSON-serializable string."""
+    m = _mem()
+    try:
+        result = getattr(m, tool)(**kwargs)
+    except Exception as exc:  # noqa: BLE001 - report the error to the model
+        return json.dumps({"error": str(exc)})
+    return json.dumps(result, default=str)
+
+
+# MCP tool definitions mirror the remote Mem0 plugin so Claude Code
+# experience is identical. Update the argument names if you change
+# the public schema.
+TOOLS = [
+    Tool(
+        name="add_memory",
+        description="Add a memory from text or a list of messages.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "messages": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "object"}},
+                    ],
+                    "description": "Plain text or OpenAI-style messages.",
+                },
+                "user_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "run_id": {"type": "string"},
+                "metadata": {"type": "object"},
+            },
+            "required": ["messages"],
+        },
+    ),
+    Tool(
+        name="search_memories",
+        description="Semantic search over stored memories.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "user_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "run_id": {"type": "string"},
+                "limit": {"type": "integer", "default": 10},
+                "filters": {"type": "object"},
+            },
+            "required": ["query"],
+        },
+    ),
+    Tool(
+        name="get_memories",
+        description="List memories with optional filters and pagination.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "run_id": {"type": "string"},
+                "limit": {"type": "integer", "default": 100},
+            },
+        },
+    ),
+    Tool(
+        name="get_memory",
+        description="Retrieve a single memory by its id.",
+        inputSchema={
+            "type": "object",
+            "properties": {"memory_id": {"type": "string"}},
+            "required": ["memory_id"],
+        },
+    ),
+    Tool(
+        name="update_memory",
+        description="Overwrite the text of an existing memory.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string"},
+                "data": {"type": "string"},
+            },
+            "required": ["memory_id", "data"],
+        },
+    ),
+    Tool(
+        name="delete_memory",
+        description="Delete a single memory by id.",
+        inputSchema={
+            "type": "object",
+            "properties": {"memory_id": {"type": "string"}},
+            "required": ["memory_id"],
+        },
+    ),
+    Tool(
+        name="delete_all_memories",
+        description="Delete every memory in the given scope.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "run_id": {"type": "string"},
+            },
+        },
+    ),
+    Tool(
+        name="delete_entities",
+        description="Delete a user/agent/run entity and all its memories.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "run_id": {"type": "string"},
+            },
+        },
+    ),
+    Tool(
+        name="list_entities",
+        description="List all known user/agent/run entities.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+]
+
+
+def _call_sync(tool: str, **kwargs: Any) -> str:
+    return asyncio.run(_call(tool, **kwargs))
+
+
+server = Server("mem0-local")
+
+
+@server.list_tools()
+async def _list_tools():
+    return TOOLS
+
+
+@server.call_tool()
+async def _call_tool(name: str, arguments: dict):
+    try:
+        text = await asyncio.to_thread(_call_sync, name, **(arguments or {}))
+    except Exception as exc:  # noqa: BLE001
+        text = json.dumps({"error": str(exc)})
+    return [TextContent(type="text", text=text)]
+
+
+async def main():
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 4.2 启动验证
+
+在终端里手动跑一下，确认 MCP server 能起来、能列工具：
+
+```bash
+OPENAI_API_KEY=sk-xx \
+MEM0_CONFIG=$HOME/.mem0/config.json \
+python ~/.mem0/local_mcp_server.py
+```
+
+它会阻塞在 stdio 等待 MCP 请求，这是预期行为；Ctrl-C 退出。
+
+## 5. 接入 Claude Code
+
+### 5.1 注册本地 MCP server
+
+Claude Code 的 MCP 配置在 `~/.claude.json`（用户级）或 `.mcp.json`（项目级）。**用户级**配置（推荐）：
+
+```json
+{
+  "mcpServers": {
+    "mem0-local": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["${HOME}/.mem0/local_mcp_server.py"],
+      "env": {
+        "MEM0_CONFIG": "${HOME}/.mem0/config.json",
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+        "PGUSER": "mem0_app",
+        "PGPASSWORD": "change-me",
+        "PGHOST": "127.0.0.1"
+      }
+    }
+  }
+}
+```
+
+> **注意**：把 `mem0-local` 命名而不是 `mem0`，以免和官方云插件（`mem0`）冲突。
+
+或者写在项目级 `.mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "mem0-local": {
+      "type": "stdio",
+      "command": "python",
+      "args": [".mem0/local_mcp_server.py"],
+      "env": {
+        "MEM0_CONFIG": "./mem0_config.json",
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+### 5.2 启动 Claude Code 并验证
+
+```bash
+# 启动新会话（让 MCP 配置生效）
+claude
+```
+
+在 Claude Code 里问：
+
+> List my mem0 entities.
+
+应该返回类似：
+
+```json
+[{"type": "user", "id": "default_user", ...}]
+```
+
+或先存一条再查：
+
+> add_memory: "The user prefers PostgreSQL over MongoDB for primary storage."
+
+> search_memories: "database preference"
+
+## 6. 可选：把图数据写进去
+
+mem0 的图存储（Apache AGE）目前**不会自动抽取**三元组，需要你显式调用 `add_to_graph`：
+
+### 6.1 一次性脚本
+
+```python
+# scripts/seed_graph.py
+import json
+from mem0 import Memory
+
+with open("mem0_config.json") as f:
+    m = Memory.from_config(json.load(f))
+
+# 注意：node label 和 relationship type 必须是 [A-Za-z_][A-Za-z0-9_]*
+triples = [
+    {
+        "source":     {"label": "Person",  "name": "alice", "properties": {"role": "engineer"}},
+        "relationship": "WORKS_ON",
+        "target":     {"label": "Project", "name": "mem0",   "properties": {}},
+    },
+    {
+        "source":     {"label": "Project", "name": "mem0",   "properties": {}},
+        "relationship": "USES",
+        "target":     {"label": "Library", "name": "pgvector", "properties": {}},
+    },
+    {
+        "source":     {"label": "Project", "name": "mem0",   "properties": {}},
+        "relationship": "USES",
+        "target":     {"label": "Library", "name": "apache_age", "properties": {}},
+    },
+]
+results = m.add_to_graph(triples, memory_id="seed-1")
+print(results)
+
+# 用向量搜索触发 graph 召回
+hits = m.search("what storage does mem0 use?", user_id="alice")
+print(hits)
+```
+
+运行：
+
+```bash
+python scripts/seed_graph.py
+```
+
+### 6.2 从 MCP 工具中写图
+
+`Memory.add_to_graph` 没有在远程 MCP 工具集中暴露，要从 Claude Code 里写图，最简单的办法是把它包装成新工具加进 `local_mcp_server.py`：
+
+```python
+# 加到 TOOLS 列表里
+Tool(
+    name="add_to_graph",
+    description="Insert (entity, relation, entity) triples into the graph store.",
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "triples": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "object",
+                            "required": ["label", "name"],
+                            "properties": {
+                                "label": {"type": "string"},
+                                "name": {"type": "string"},
+                                "properties": {"type": "object"},
+                            },
+                        },
+                        "relationship": {"type": "string"},
+                        "target": {
+                            "type": "object",
+                            "required": ["label", "name"],
+                            "properties": {
+                                "label": {"type": "string"},
+                                "name": {"type": "string"},
+                                "properties": {"type": "object"},
+                            },
+                        },
+                    },
+                },
+            },
+            "memory_id": {"type": "string"},
+        },
+        "required": ["triples"],
+    },
+),
+# 在 _call_sync 里把 tool 转发到 m.add_to_graph(triples, memory_id=memory_id)
+```
+
+重启 Claude Code 会话即可。
+
+## 7. 验证清单
+
+| 步骤 | 期望结果 | 检查命令 |
+| --- | --- | --- |
+| PostgreSQL 扩展装好 | `vector` 和 `age` 在 extension 列表 | `psql -c "\dx"` |
+| mem0 启动期自检 | 自动 `CREATE EXTENSION IF NOT EXISTS age` + `create_graph('mem0_graph')` 成功 | `psql -d mem0 -c "SELECT * FROM ag_graph;"` |
+| 向量写入 | `m.add(messages, user_id='alice')` 不报错 | `psql -c "SELECT count(*) FROM mem0_vectors;"` |
+| 图写入 | `m.add_to_graph(triples)` 返回 3 条 edge_id | `psql -c "SELECT * FROM mem0_graph._ag_label_vertex;"` |
+| Claude Code 看到工具 | `/mcp` 列出 `mem0-local` 下的 9（或 10）个工具 | Claude Code 内 `/mcp` |
+| 端到端 | 写入一条记忆，再次搜索能找到 | Claude Code 聊天窗口 |
+
+## 8. 常见问题
+
+**Q: 启动时 `relation "ag_graph" does not exist`。**
+A: AGE 扩展建在 `ag_catalog` 模式里，不在默认 `search_path` 里。`mem0ai` 的 `ApacheAGE` 实现会在每个连接上 `SET search_path = ag_catalog, "$user", public` —— 确认你的角色对 `ag_catalog` 有 `USAGE`/`SELECT` 权限（见 2.2 节）。
+
+**Q: `function create_graph(unknown) does not exist`。**
+A: 同上，并且要确认 `LOAD 'age'` 已经执行（mem0 启动时已经做了）。如果用 RDS 或受限环境 AGE 不可用，需要换 [Neo4j/Memgraph](/components/graph-stores/overview)。
+
+**Q: `failed to construct the join relation`（搜索时）。**
+A: 已知是 Apache AGE 1.7 的 cypher parser 限制：跨标签全文搜索 `MATCH (n) WHERE any(k IN keys(n) WHERE toString(n[k]) CONTAINS ...)` 会触发该错误。`mem0ai` 已自动用 SQL 走 `<graph>._ag_label_vertex` 表，绕开这个 bug；如果你自己写 cypher 触发这个错误，请改用 label 限定或 SQL 回退。
+
+**Q: `IndexError: tuple index out of range` 当属性值含 `%`。**
+A: 已在 `mem0ai` ≥ 当前版本中通过 `sql.SQL`/`sql.Literal` 组合修复（不再用 `%s` 占位符）。如果你自己写 cypher 调用 `cypher()`，把属性值用 `$$ ... $$` 直接内联即可。
+
+**Q: 写入记忆后再读不到。**
+A: `pgvector` 默认异步提交，`mem0` 写入后会显式 `commit`；但如果你的连接池把脏连接回收到 `Memory.add_to_graph` 之外的事务里，AGE 图写入可能落在未提交事务中。`mem0ai` 的 `ApacheAGE` 已加 `commit=True`；如果你自己写 `cypher()` 调用记得 `conn.commit()`。
+
+**Q: 图标签/关系名包含空格、点、连字符会怎样？**
+A: `_SAFE_IDENT` 校验只接受 `[A-Za-z_][A-Za-z0-9_]*`；其他字符会在 `add_node`/`add_edge` 时抛 `ValueError`，避免 Cypher 注入。如需非 ASCII 标签，请先清洗数据。
+
+## 9. 备份与运维
+
+- **向量备份**：`pg_dump mem0 --table='mem0_vectors*'`，或用 `pg_basebackup`；
+- **图备份**：AGE 扩展表在 `<graph_name>."_ag_label_*"` 和 per-label 表里，`pg_dump` 整库即可；
+- **重置图（保留扩展）**：`m.graph_store.reset()` —— drop 并重建 graph namespace，AGE 扩展本身不动；
+- **彻底清空**：`m.delete_all(user_id="alice")` 删除向量；`m.graph_store.delete_all()` 清空图；
+- **观察**：`SELECT relname, n_live_tup FROM pg_stat_user_tables WHERE schemaname IN ('public', 'mem0_graph') ORDER BY n_live_tup DESC;`
+
+## 相关文档
+
+- [Claude Code（云）集成](/integrations/claude-code)
+- [pgvector 组件文档](/components/vectordbs/dbs/pgvector)
+- [Apache AGE 组件文档](/components/graph-stores/dbs/apache_age)
+- [Graph Stores 概览](/components/graph-stores/overview)

@@ -28,6 +28,26 @@ from mem0.graphs.base import GraphStoreBase
 from mem0.utils.factory import GraphStoreFactory
 
 
+def _cypher_body_of(mock_cursor):
+    """Return the Cypher text passed to the ``cypher()`` call.
+
+    The cypher body is inlined inside ``$$ ... $$`` in the SQL string —
+    extract it from the SQL text rather than the params tuple (which now
+    only holds the graph name).
+    """
+    import re
+
+    for call in mock_cursor.execute.call_args_list:
+        sql = str(call.args[0]) if call.args else str(call.kwargs.get("query", ""))
+        if "cypher(" not in sql:
+            continue
+        m = re.search(r"\$\$\s*(.*?)\s*\$\$", sql, re.DOTALL)
+        if m is None:
+            continue
+        return m.group(1)
+    raise AssertionError("No cypher() call found in mock_cursor.execute history")
+
+
 class TestIdentifierValidation(unittest.TestCase):
     """Identifier safety: graph names, labels, rel types go into Cypher raw strings."""
 
@@ -37,11 +57,11 @@ class TestIdentifierValidation(unittest.TestCase):
 
     def test_safe_ident_rejects_injection(self):
         for name in [
-            "1graph",         # leading digit
-            "graph; DROP",    # SQL injection
-            "graph-name",     # hyphen
-            "graph.name",     # dot
-            "graph name",     # whitespace
+            "1graph",  # leading digit
+            "graph; DROP",  # SQL injection
+            "graph-name",  # hyphen
+            "graph.name",  # dot
+            "graph name",  # whitespace
             "",
         ]:
             self.assertFalse(bool(_SAFE_IDENT.match(name)), f"should reject: {name!r}")
@@ -58,8 +78,7 @@ class TestParseAgtype(unittest.TestCase):
     """The _parse_agtype helper turns AGE's text-shaped results into Python values."""
 
     def test_parses_json_object(self):
-        self.assertEqual(ApacheAGE._parse_agtype('{"id": 1, "label": "Person"}'),
-                         {"id": 1, "label": "Person"})
+        self.assertEqual(ApacheAGE._parse_agtype('{"id": 1, "label": "Person"}'), {"id": 1, "label": "Person"})
 
     def test_parses_json_array(self):
         self.assertEqual(ApacheAGE._parse_agtype('["a", "b"]'), ["a", "b"])
@@ -193,10 +212,10 @@ class TestApacheAGEQueries(unittest.TestCase):
         node_id = self.store.add_node("Person", {"name": "alice", "age": 30})
 
         self.assertEqual(node_id, "42")
-        # The cypher body is the second element of the params tuple
-        # `cur.execute("...cypher(%s, %s)", (graph_name, body))`.
-        cypher_body = self.mock_cursor.execute.call_args_list[0].args[1][1]
-        self.assertIn("CREATE (n:Person)", cypher_body)
+        cypher_body = _cypher_body_of(self.mock_cursor)
+        self.assertIn("CREATE (n:Person", cypher_body)
+        self.assertIn("alice", cypher_body)
+        self.assertIn("age", cypher_body)
         self.assertIn("RETURN id(n)", cypher_body)
 
     def test_add_node_rejects_invalid_label(self):
@@ -209,37 +228,42 @@ class TestApacheAGEQueries(unittest.TestCase):
         edge_id = self.store.add_edge("1", "2", "KNOWS", {"since": 2020})
 
         self.assertEqual(edge_id, "99")
-        cypher_body = self.mock_cursor.execute.call_args_list[0].args[1][1]
+        cypher_body = _cypher_body_of(self.mock_cursor)
         self.assertIn("MATCH (a), (b)", cypher_body)
         self.assertIn("id(a) = 1", cypher_body)
         self.assertIn("id(b) = 2", cypher_body)
         self.assertIn("CREATE (a)-[r:KNOWS]->(b)", cypher_body)
+        # The properties are inlined as a Cypher map literal.
+        self.assertIn("since", cypher_body)
+        self.assertIn("2020", cypher_body)
 
     def test_add_edge_rejects_invalid_rel_type(self):
         with self.assertRaises(ValueError):
             self.store.add_edge("1", "2", "DROP TABLE x", {})
 
     def test_get_node_returns_parsed(self):
-        self.mock_cursor.fetchall.return_value = [
-            ('{"id": 7, "label": "Person", "properties": {"name": "bob"}}',)
-        ]
+        self.mock_cursor.fetchall.return_value = [('{"id": 7, "label": "Person", "properties": {"name": "bob"}}',)]
 
         result = self.store.get_node("7")
 
-        self.assertEqual(result, {
-            "id": "7",
-            "label": "Person",
-            "properties": {"name": "bob"},
-        })
+        self.assertEqual(
+            result,
+            {
+                "id": "7",
+                "label": "Person",
+                "properties": {"name": "bob"},
+            },
+        )
 
     def test_get_node_returns_none_when_missing(self):
         self.mock_cursor.fetchall.return_value = []
         self.assertIsNone(self.store.get_node("999"))
 
     def test_search_filters_payload(self):
+        # SQL fallback: 3 columns (id, label, raw agtype properties).
         self.mock_cursor.fetchall.return_value = [
-            ('{"id": 1, "label": "Person", "properties": {"name": "alice", "user_id": "u1"}}',),
-            ('{"id": 2, "label": "Person", "properties": {"name": "bob",   "user_id": "u2"}}',),
+            (1, "Person", '{"name": "alice", "user_id": "u1"}'),
+            (2, "Person", '{"name": "bob",   "user_id": "u2"}'),
         ]
 
         results = self.store.search("alice", limit=10, filters={"user_id": "u1"})
@@ -259,8 +283,10 @@ class TestApacheAGEQueries(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["id"], "5")
         self.assertEqual(results[0]["distance"], 1)
-        cypher_body = self.mock_cursor.execute.call_args_list[0].args[1][1]
+        cypher_body = _cypher_body_of(self.mock_cursor)
         self.assertIn(":WORKS_ON|OWNS", cypher_body)
+        # `size()` not `length()` for variable-length patterns.
+        self.assertIn("size(r)", cypher_body)
 
     def test_get_neighbors_rejects_invalid_rel_types(self):
         # All rel_types are invalid → should yield nothing, not run a query.
@@ -271,14 +297,14 @@ class TestApacheAGEQueries(unittest.TestCase):
         self.mock_cursor.fetchall.return_value = []
         self.store.delete_node("42")
 
-        cypher_call = self.mock_cursor.execute.call_args_list[0]
-        self.assertIn("MATCH (n) WHERE id(n) = 42 DETACH DELETE n", cypher_call.args[1])
+        cypher_body = _cypher_body_of(self.mock_cursor)
+        self.assertIn("MATCH (n) WHERE id(n) = 42 DETACH DELETE n", cypher_body)
 
     def test_delete_all_runs_unscoped_detach(self):
         self.mock_cursor.fetchall.return_value = []
         self.store.delete_all()
-        cypher_call = self.mock_cursor.execute.call_args_list[0]
-        self.assertIn("MATCH (n) DETACH DELETE n", cypher_call.args[1])
+        cypher_body = _cypher_body_of(self.mock_cursor)
+        self.assertIn("MATCH (n) DETACH DELETE n", cypher_body)
 
     def test_reset_drops_and_recreates_graph(self):
         # First call (drop_graph) returns success, _ensure_graph_exists then
@@ -331,7 +357,10 @@ class TestMemoryConfigIntegration(unittest.TestCase):
             graph={
                 "provider": "apache_age",
                 "config": {
-                    "user": "u", "password": "p", "host": "h", "port": 5432,
+                    "user": "u",
+                    "password": "p",
+                    "host": "h",
+                    "port": 5432,
                 },
             }
         )
@@ -356,13 +385,17 @@ class TestMemoryGraphWiring(unittest.TestCase):
 
         fake_store = MagicMock(spec=GraphStoreBase)
         # Pretend the factory hands back our fake.
-        with patch(
-            "mem0.memory.main.GraphStoreFactory.create", return_value=fake_store
-        ) as factory_mock:
+        with patch("mem0.memory.main.GraphStoreFactory.create", return_value=fake_store) as factory_mock:
             cfg = MemoryConfig(
-                graph={"provider": "apache_age", "config": {
-                    "user": "u", "password": "p", "host": "h", "port": 5432,
-                }}
+                graph={
+                    "provider": "apache_age",
+                    "config": {
+                        "user": "u",
+                        "password": "p",
+                        "host": "h",
+                        "port": 5432,
+                    },
+                }
             )
             mem = Memory.__new__(Memory)
             mem.config = cfg

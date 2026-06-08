@@ -302,6 +302,7 @@
                         "icon": "share-nodes",
                         "pages": [
                           "components/graph-stores/overview",
+                          "components/graph-stores/auto-extraction",
                           {
                             "group": "Supported Graph Stores",
                             "icon": "list",

@@ -1,0 +1,403 @@
+---
+title: "Auto-extraction of graph triples"
+description: "Why mem0's graph store doesn't auto-extract (entity, relation, entity) triples today, what the user-visible impact is, and how to bridge the gap until the official extractor lands."
+---
+
+# Auto-extraction of graph triples
+
+Mem0's `Memory.add_to_graph(triples, memory_id=...)` is **a write API, not an
+extractor**. You give it already-shaped `(source, rel, target)` dicts and it
+persists them. The natural-language → triples step — the part most users
+expect an LLM-backed memory layer to handle — is **not** wired into
+`Memory.add()` today. This page explains why, what the user-facing impact is,
+and what you can do right now to bridge the gap.
+
+> **TL;DR.** Configure `graph_store` and call `m.add(messages, ...)` — only
+> the vector store is populated; the graph is empty. To get triples into
+> Apache AGE / Neo4j / etc., build them yourself and call `m.add_to_graph()`
+> (or use the helper at the bottom of this page). The official extractor is
+> on the roadmap.
+
+## 1. The two write paths are decoupled
+
+`mem0/memory/main.py` exposes two independent entry points:
+
+| Path | API | Does LLM extraction? | Touches the graph? |
+| --- | --- | --- | --- |
+| A | `Memory.add(messages, user_id=...)` | Yes (Phases 2 / "LLM extraction (single call)" of the V3 batch pipeline, using `ADDITIVE_EXTRACTION_PROMPT`) | **No** — only the vector store is written |
+| B | `Memory.add_to_graph(triples, memory_id=...)` | No — caller-supplied triples are persisted verbatim | Yes — only the graph is written |
+
+The pipeline in path A asks the LLM for **flat memory facts** in the shape
+`{"memory": [{"text": "...", "categories": [...]}, ...]}`. It never asks
+"which entities, which relations", and it never invokes
+`add_to_graph`. `graph_store` is referenced only when a caller invokes path B
+directly.
+
+The closest related feature is `extract_entities` in
+`mem0.utils.entity_extraction`, used by the **entity-boost** search
+(`mem0/memory/main.py:613`). That extracts entity names from a query at
+search time and uses them to bias vector results — it does not write to the
+graph, does not traverse relationships, and is silent when entities don't
+match.
+
+## 2. Why the extractor is deferred
+
+Pushing triple extraction into `Memory.add()` raises several engineering
+tradeoffs that the project has explicitly chosen to defer:
+
+### 2.1 The two extraction tasks have different cognitive shapes
+
+| | Memory extraction (what `add()` does today) | Triple extraction |
+| --- | --- | --- |
+| Question to the LLM | "Which facts are worth remembering?" | "Which entities, what relations between them?" |
+| Output schema | `{"text": "...", "categories": [...]}` | `{"source": {label, name}, "relationship", "target": {label, name}}` |
+| Aggregation goal | Merge into existing facts; dedup by hash | Merge by entity canonical name; dedup by `(label, name)` |
+| Failure mode | Recall miss (harmless) | Wrong label / wrong entity boundary (graph-polluting) |
+
+Combining them in one prompt dilutes the LLM's attention and tends to
+degrade both. Splitting them across two calls roughly doubles LLM cost and
+latency for **every** `add()`, including users who never use the graph
+store.
+
+### 2.2 The graph layer has no schema contract
+
+`GraphStoreBase` deliberately allows arbitrary labels and relationship types
+per call. The Apache AGE implementation enforces a strict ASCII identifier
+regex on top:
+
+```python
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+```
+
+A naive LLM extractor will produce labels that violate this — `"Project:AI"`,
+`"工程师"`, `"Tech Lead"`, `"C++-dev"` — and `add_node()` will raise
+`ValueError`. A real extractor needs a label-normalisation layer (synonym
+buckets, casing, transliteration) that hasn't been built.
+
+### 2.3 Triple extraction is still noisy
+
+The state of the art for open-schema triple extraction (LangChain's
+`LLMGraphTransformer`, LlamaIndex's `PropertyGraphIndex`, Microsoft's
+`graphrag`) typically requires either schema hints or post-extraction
+filtering. Hard-coding it into the hot write path would either fail often
+or pollute the graph with bad nodes.
+
+### 2.4 A roadmap decision, not an oversight
+
+The Apache AGE doc explicitly states:
+
+> Mem0 doesn't auto-extract `(entity, relation, entity)` triples from text
+> yet — the LLM-based extractor is on the roadmap.
+
+The strategy is: ship the store + the API first, build the extractor when
+the schema/quality story is solid.
+
+### 2.5 The cost dimension
+
+Today, `Memory.add()` with `infer=True` already performs one LLM call
+(extraction) plus one embedding call per write. Adding triple extraction
+in the same call or a follow-up roughly doubles the LLM cost, which is
+significant for high-volume ingestion.
+
+## 3. User-visible impact
+
+The limitation is silent in many situations and loud in others. The
+following are the patterns users actually hit in production:
+
+### 3.1 The graph is empty after `m.add()`
+
+```python
+m = Memory.from_config({..., "graph_store": {"provider": "apache_age", ...}})
+m.add(messages, user_id="alice")        # writes vector store
+m.search_graph("alice's projects")       # returns []
+```
+
+The user configured `graph_store` expecting it to "just work" the way a
+Neo4j-backed LangChain app would. It doesn't. They have to discover the
+two-write API and add a second pipeline.
+
+### 3.2 No graph-aware recall in `m.search()`
+
+`Memory.search()` runs vector search plus entity-boost search. It does
+**not** query the graph to expand results with related entities. To get
+graph recall, the user must call `Memory.search_graph()` separately, then
+deduplicate, then rank. The two APIs have different signatures and live at
+different layers; agent integrations (Claude Code, Cursor, etc.) have to
+expose both tools to be useful.
+
+### 3.3 Schema design is the user's job
+
+`add_to_graph` expects strictly-typed triple dicts:
+
+```python
+triples = [{
+    "source":      {"label": "Person",  "name": "alice", "properties": {"role": "engineer"}},
+    "relationship": "WORKS_ON",
+    "target":      {"label": "Project", "name": "mem0",   "properties": {}},
+}]
+```
+
+Label and relationship must match `^[A-Za-z_][A-Za-z0-9_]*$`. Chinese
+labels, hyphens, dots, and spaces all raise `ValueError`. The user
+typically runs another LLM call to extract triples, then a second
+clean-up pass to coerce the output — "one API call" mental model is broken.
+
+### 3.4 Vector store and graph store drift over time
+
+Every `m.add()` updates the vector store. The graph only updates when the
+user remembers to call `add_to_graph`. If they write a few `add()` calls
+and then `add_to_graph` with stale triples, the graph reflects an old
+snapshot of the conversation. The graph store is, by default, manually
+maintained.
+
+### 3.5 `memory_id` linkage is manual
+
+`add_to_graph(triples, memory_id=...)` is a hand-threaded parameter. The
+user has to call `m.add(messages)`, get back a `memory_id` from
+`result["results"][0]["id"]`, then call `m.add_to_graph(triples,
+memory_id=that_id)`. There is no implicit "auto-tag all triples created
+in this session with this memory_id" — and no API to delete a memory's
+graph fragment in one shot.
+
+### 3.6 No inverse / update semantics
+
+`Memory.update(memory_id, new_text)` updates the vector but does **not**
+walk the graph and rewrite the triples that referred to the old fact. Two
+graph writes are needed: `m.graph_store.delete_node(old_entity_id)` (if
+you can find it) and `m.add_to_graph(new_triples, memory_id=...)`. The
+graph is effectively append-only with two escape hatches: `delete_node` and
+`delete_all`.
+
+### 3.7 Two search APIs that don't unify
+
+`m.search(...)` returns flat facts. `m.search_graph(...)` returns nodes
+with payloads. They have different return shapes, different filters, and
+no built-in "vector + graph" merge. Anyone building an agent has to
+implement the merge strategy themselves.
+
+### 3.8 Documentation is ambiguous for new users
+
+The Apache AGE doc opens with "Mem0 doesn't auto-extract triples yet" and
+then shows hand-written triple construction. New users read this as "this
+is a build-your-own-pipeline feature" and skip it. The graph store is
+configured far less often than it would be if the integration was
+turnkey.
+
+### 3.9 Async mirror inherits the same gap
+
+`AsyncMemory.add_to_graph` is implemented as a delegate to
+`Memory.add_to_graph.__get__` (see `mem0/memory/main.py:1992-1999`).
+Whatever extractor eventually lands will need to be wired through both the
+sync and async paths, and any divergence will surface as a subtle bug.
+
+### 3.10 No graph expansion in agent recall
+
+In an agent loop, the most useful question is often "what does the user
+know about X, including everything connected to X?" This needs a one-hop
+or two-hop graph traversal after the vector recall. mem0 has no built-in
+"vector recall + graph expand" path. Users who want this end up writing
+custom orchestration.
+
+## 4. Bridging the gap: a minimal extractor
+
+The official extractor is on the roadmap. Until it lands, this drop-in
+helper runs **one** LLM call per `add()` (reusing the LLM already
+configured on the `Memory` instance), normalises the output to
+`[A-Za-z_][A-Za-z0-9_]*` identifiers, and forwards to
+`Memory.add_to_graph()`. It's a single file, ~50 lines, and degrades
+gracefully on every error.
+
+```python
+# mem0_helpers/graph_extractor.py
+import json
+import re
+from typing import Any, Dict, List, Optional
+
+from mem0 import Memory
+
+_SAFE = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def _ident(s: str) -> str:
+    """Coerce any string to a valid AGE-style identifier.
+
+    Rules (post-hoc, conservative):
+      - replace any run of non-[A-Za-z0-9_] with "_"
+      - if the result is empty, return "UNNAMED"
+      - if it doesn't start with a letter or "_", prepend "N_"
+      - truncate to 63 chars (PostgreSQL NAMEDATALEN - 1)
+    """
+    s = _SAFE.sub("_", s).strip("_")
+    if not s:
+        return "UNNAMED"
+    if not (s[0].isalpha() or s[0] == "_"):
+        s = "N_" + s
+    return s[:63]
+
+
+EXTRACT_PROMPT = """\
+Extract durable (entity, relationship, entity) triples from the text.
+Output ONLY valid JSON in this exact shape:
+
+{{
+  "triples": [
+    {{
+      "source": {{"label": "PERSON", "name": "<canonical short form>"}},
+      "relationship": "WORKS_ON",
+      "target":  {{"label": "PROJECT", "name": "<canonical short form>"}}
+    }}
+  ]
+}}
+
+Constraints:
+- `label` and `relationship` MUST be UPPER_SNAKE_CASE ASCII identifiers
+  (e.g. PERSON, PROJECT, COMPANY, LIBRARY, WORKS_ON, USES, KNOWS,
+  MANAGES, OWNS, PART_OF).
+- `name` is the short canonical form as it appears in the text.
+- Only durable, factual relationships. Skip greetings, opinions,
+  and one-off utterances.
+- Maximum 25 triples per call. Quality over quantity.
+- If there are no durable relationships, output {{"triples": []}}.
+
+Text:
+"""
+
+
+def extract_and_add_graph(
+    memory: Memory,
+    text: str,
+    *,
+    memory_id: Optional[str] = None,
+    max_triples: int = 25,
+) -> List[Dict[str, str]]:
+    """Run a single LLM pass and append normalised triples to the graph.
+
+    Costs one extra LLM call per invocation. Reuses the LLM already
+    configured on the Memory instance. Returns the
+    ``[{source_id, target_id, edge_id}, ...]`` list from
+    ``Memory.add_to_graph``, or ``[]`` on any failure.
+    """
+    if not text or not text.strip():
+        return []
+
+    raw = memory.llm.generate_response(
+        messages=[
+            {"role": "system", "content": "You output only valid JSON."},
+            {"role": "user",   "content": EXTRACT_PROMPT + text},
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    try:
+        triples_raw = json.loads(raw).get("triples", [])[:max_triples]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+
+    safe: List[Dict[str, Any]] = []
+    for t in triples_raw:
+        try:
+            s_label = _ident(t["source"]["label"])
+            t_label = _ident(t["target"]["label"])
+            rel     = _ident(t["relationship"])
+            s_name  = str(t["source"]["name"])[:200].strip()
+            t_name  = str(t["target"]["name"])[:200].strip()
+            if not (s_label and t_label and rel and s_name and t_name):
+                continue
+            safe.append({
+                "source":      {"label": s_label, "name": s_name, "properties": {}},
+                "relationship": rel,
+                "target":      {"label": t_label, "name": t_name, "properties": {}},
+            })
+        except (KeyError, TypeError):
+            continue
+
+    if not safe:
+        return []
+    return memory.add_to_graph(safe, memory_id=memory_id)
+```
+
+### 4.1 Using it in your `add` wrapper
+
+```python
+from mem0 import Memory
+from mem0_helpers.graph_extractor import extract_and_add_graph
+
+m = Memory.from_config(config)
+
+def my_add(messages, user_id):
+    result = m.add(messages, user_id=user_id)        # writes vector
+    if result.get("results"):
+        memory_id = result["results"][0]["id"]
+        text = " ".join(
+            mg.get("content", "")
+            for mg in messages
+            if isinstance(mg, dict)
+        )
+        extract_and_add_graph(m, text, memory_id=memory_id)
+    return result
+```
+
+`memory_id` is set on every created node and edge, which means you can
+later delete a single memory's graph fragment with raw Cypher:
+
+```sql
+SELECT * FROM cypher('mem0_graph', $$
+  MATCH (n {memory_id: 'mem-123'}) DETACH DELETE n
+$$) AS r(result agtype);
+```
+
+### 4.2 When to skip extraction
+
+- **High-volume ingestion** where one extra LLM call per write is too
+  expensive. In that case, run extraction as a background batch job
+  (e.g. nightly) over the messages stored in the history DB.
+- **Languages whose LLM output doesn't reliably produce ASCII labels.**
+  The `_ident` coercion is a safety net, but it loses semantics for CJK
+  names. If your deployment is multi-lingual, add a label-vocabulary
+  whitelist before `_ident` is called, or skip extraction entirely and
+  hand-author the graph.
+- **Graphs that must be deterministic.** The LLM may produce different
+  triples for semantically equivalent text. If your graph powers an audit
+  trail, hand-authoring is safer.
+
+## 5. What a proper solution would need
+
+A first-class auto-extractor that ships inside `Memory.add()` should
+cover, in order of dependency:
+
+1. **Label-normalisation layer.** Canonicalise entity names to
+   `(label, canonical_name)`, with a small embedding-similarity cache for
+   "is this the same person as last week?". This is the hardest piece
+   and the one that determines whether the graph stays clean or fills up
+   with `Alice` / `alice` / `Ms. Smith` / `A. Smith` nodes.
+2. **Extraction prompt + validation, decoupled from memory extraction.**
+   Reuse the same LLM client but with a separate prompt and a separate
+   JSON schema, so each task keeps its focus.
+3. **Update semantics.** When `Memory.update(memory_id, new_text)` runs,
+   walk the graph for triples tagged with that `memory_id`, check whether
+   the underlying entities/relations still hold, and rewrite the affected
+   edges. Without this, the graph is monotonically accumulating and
+   diverges from the vector store.
+4. **Search integration.** Have `Memory.search()` automatically call
+   `search_graph` for one-hop expansion on the top-k vector hits, then
+   merge using the same scoring rules as `entity_boost`. Without this,
+   the graph store is write-only.
+5. **Failure containment.** The graph write path must never break the
+   vector write. If extraction fails, schema validation fails, or the
+   graph store is offline, `Memory.add()` returns success on the vector
+   side and logs a warning on the graph side. Today's design supports
+   this — `Memory.add_to_graph` returns `[]` when no graph store is
+   configured — but it needs explicit hardening for the new failure
+   modes (LLM timeout, JSON parse, label-validator reject).
+
+Items 1 + 2 + 5 are achievable as a community patch; 3 + 4 are upstream
+behavioural changes that the project should own. Until the upstream
+land, the helper above is the simplest way to get "write once, populate
+both" behaviour.
+
+## 6. Related pages
+
+- [Apache AGE graph store](/components/graph-stores/dbs/apache_age) — provider reference, identifier rules
+- [Graph stores overview](/components/graph-stores/overview) — when to enable / when to skip
+- [Claude Code (self-hosted) integration](/integrations/claude-code-pgvector-age) — end-to-end deployment with the helper above
+- [Memory class API](https://docs.mem0.ai/api-reference/memory) — `add`, `search`, `update`, `delete_all` reference

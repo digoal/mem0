@@ -180,6 +180,7 @@ If the user is on a pre-current major (Python < 2, TS < 3, or Platform `output_f
 - [Open Source Configuration](https://docs.mem0.ai/open-source/configuration) [OSS]: Use when configuring `Memory` - LLM, embedder, vector store, graph store.
 - [Graph Stores Overview](https://docs.mem0.ai/components/graph-stores/overview) [OSS]: Use when the user wants relationship-aware (entity, relation, entity) memory on top of vector search.
 - [Apache AGE Graph Store](https://docs.mem0.ai/components/graph-stores/dbs/apache_age) [OSS]: Use when the user wants graph memory on PostgreSQL via Apache AGE, including sharing a single PG connection pool between pgvector and the graph store.
+- [Auto-Extraction of Graph Triples](https://docs.mem0.ai/components/graph-stores/auto-extraction) [OSS]: Use when the user is surprised that `Memory.add()` does not populate the graph store, or wants to wire LLM triple extraction into the add path today (includes a drop-in helper).
 - [Open Source Python Quickstart](https://docs.mem0.ai/open-source/python-quickstart) [OSS]: Use for the first self-hosted Python integration.
 - [Open Source Node.js Quickstart](https://docs.mem0.ai/open-source/node-quickstart) [OSS]: Use for the first self-hosted Node integration.
 - [Self-Hosted Setup](https://docs.mem0.ai/open-source/setup) [OSS]: Use when standing up the bundled REST server and dashboard via Docker Compose, including auth, API keys, and the setup wizard.
